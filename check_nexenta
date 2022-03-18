@@ -106,7 +106,6 @@ package SNMPTranslate;
 		my $r={};
 		foreach my $k ( keys %{$roid} ) {
 			my $value=$roid->{$k};
-			#my $name=$self->oid2name($k);
 			my ($full, $name, $instance)=$self->oid2name_all($k);
 			$r->{$full}={ name => $name, instance => $instance, value => $value };
 		}
@@ -130,25 +129,27 @@ package Nexenta;
 
 		bless $self, $class;
 
-		$self->read_zpoolhealth();
+		$self->_zpool_health_read();
 
 		return $self;
 	}
 
-	sub read_zpoolhealth {
+	sub _zpool_health_read {
 		my ($self) = @_;
 
-		#my $request=$self->{translate}->request("zpoolHealth");
-		
 		my $baseoid=$self->{translate}->name2oid("zpoolHealth");
 		my $result=$self->{snmp}->get_table(-baseoid => $baseoid);
-
-		#my $roid=$self->{snmp}->get_request(-varbindlist => $request );	
-		#my $r=$self->{translate}->response($roid);
-
-		my $r=$self->{translate}->response($result);
-		print Dumper($r);
+		$self->{zpoolhealth}=$self->{translate}->response($result);
 	}
+
+	sub zpool_health {
+		my ($self) = @_;
+
+		my @zpools=values %{$self->{zpoolhealth}};
+
+		return \@zpools;
+	}
+
 1;
 
 package main;
@@ -192,6 +193,11 @@ package main;
 
 	my $snmpsession=snmp_new_session($opt);
 	my $n=new Nexenta($snmpsession);
+
+	foreach my $zpool ( @{$n->zpool_health()} ) {
+		$np->add_message(($zpool->{value} eq 'ONLINE') ? OK : CRITICAL,
+			sprintf("Zpool %s %s;", $zpool->{instance}, $zpool->{value} ));
+	}
 
 	my ($code, $message) = $np->check_messages();
 	$np->plugin_exit( $code, $message );
