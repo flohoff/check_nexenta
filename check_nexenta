@@ -9,6 +9,10 @@ package SNMPTranslate;
 		"zpoolHealth"		=> { oid => ".1.3.6.1.4.1.40045.100.2.1.1.2.5",
 						instance => 'string' 
 					},
+		"sunFmFaultEventClass"	=> { oid => ".1.3.6.1.4.1.42.2.195.1.2.1.4",
+						instance => 'uuidnum' },
+		"sunFmFaultLocation"	=> { oid => ".1.3.6.1.4.1.42.2.195.1.2.1.10",
+						instance => 'uuidnum' },
 		"sunFmResourceStatus"	=> { oid => ".1.3.6.1.4.1.42.2.195.1.5.1.3",
 						value => 'table',
 						values => {
@@ -68,6 +72,18 @@ package SNMPTranslate;
 		return $string
 	}
 
+	sub instance_decode_uuidnum {
+		my ($self, $instance) = @_;
+		# .36.49.48.51.99.55.102.100.100.45.51.50.56.99.45.54.102.98.101.45.98.55.55.55.45.100.57.98.50.102.48.98.48.50.49.97.57.1
+		$instance =~ s/^\.//;
+		my @elem=split(/\./, $instance);
+		my $count=shift @elem;
+		my $uuid=join("", map { chr($_) } splice(@elem, 0, $count));
+
+		return sprintf('"%s".%s', $uuid, join(".", @elem));
+	}
+
+
 	sub value_decode_table {
 		my ($self, $value, $def) = @_;
 
@@ -104,6 +120,8 @@ package SNMPTranslate;
 
 		if ($def->{instance} eq 'string') {
 			return $self->instance_decode_string($instance);
+		} elsif ($def->{instance} eq 'uuidnum') {
+			return $self->instance_decode_uuidnum($instance);
 		}
 
 		return $instance;
@@ -153,6 +171,8 @@ package SNMPTranslate;
 1;
 
 package Nexenta;
+	use strict;
+	use List::Util qw/uniq/;
 	use Net::SNMP;
 	use Data::Dumper;
 
@@ -172,27 +192,64 @@ package Nexenta;
 		return $self;
 	}
 
+	sub _sun_fm_location_for_resource {
+		my ($self, $rid) = @_;
+
+		my @matching=uniq map { s/\s+$//; $_; } map { $_->{value}{value}; }
+			grep { $_->{instance} =~ /\.$rid$/ }
+			values %{$self->{sunfm}{location}};
+
+		return join(",", @matching);
+	}
+
+	sub _sun_fm_class_for_resource {
+		my ($self, $rid) = @_;
+
+		my @matching=uniq map { s/\s+$//; $_; } map { $_->{value}{value}; }
+			grep { $_->{instance} =~ /\.$rid$/ }
+			values %{$self->{sunfm}{class}};
+
+		return join(",", @matching);
+	}
+
 	sub _sun_fm_read {
 		my ($self) = @_;
 
-		my $oids=$self->{translate}->request("sunFmResourceStatus.1");
-		my $result=$self->{snmp}->get_request(-varbindlist => $oids);
+		$self->{snmp}->max_msg_size(32768);
 
-		$self->{sunfm}=$self->{translate}->response($result);
+		my $ecr=$self->{snmp}->get_table(
+				-baseoid => $self->{translate}->name2oid("sunFmFaultEventClass"));
+		$self->{sunfm}{class}=$self->{translate}->response($ecr);
+
+		my $rrs=$self->{snmp}->get_table(
+				-baseoid => $self->{translate}->name2oid("sunFmResourceStatus"));
+		$self->{sunfm}{status}=$self->{translate}->response($rrs);
+
+		my $rfl=$self->{snmp}->get_table(
+				-baseoid => $self->{translate}->name2oid("sunFmFaultLocation"));
+		$self->{sunfm}{location}=$self->{translate}->response($rfl);
+
 	}
 
 	sub sun_fm {
 		my ($self) = @_;
 
-		return $self->{sunfm}{"sunFmResourceStatus.1"}{value}{string};
+		my @events=map { $_->{statusstring}=sprintf("%s %s %s", $_->{status}, $_->{location}, $_->{class}); $_ }
+			map { $_->{status}=$_->{value}{string}; delete($_->{value}); $_; }
+			map { $_->{class}=$self->_sun_fm_class_for_resource($_->{id}); $_; }
+			map { $_->{location}=$self->_sun_fm_location_for_resource($_->{id}); $_;} 
+			map { $_->{id}=$_->{instance}; $_->{id}=~s/^\.//; $_; }
+			values %{$self->{sunfm}{status}};
+
+		return \@events;
 	}
 
 	sub _zpool_health_read {
 		my ($self) = @_;
 
 		my $baseoid=$self->{translate}->name2oid("zpoolHealth");
-		my $result=$self->{snmp}->get_table(-baseoid => $baseoid);
-		$self->{zpoolhealth}=$self->{translate}->response($result);
+		#	my $result=$self->{snmp}->get_table(-baseoid => $baseoid);
+		#$self->{zpoolhealth}=$self->{translate}->response($result);
 	}
 
 	sub zpool_health {
@@ -258,9 +315,15 @@ package main;
 			sprintf("Zpool %s %s;", $zpool->{name}, $zpool->{status} ));
 	}
 
-	my $fm=$n->sun_fm();
-	$np->add_message(($fm eq 'ok') ? OK : CRITICAL,
-			sprintf("Sun FaultManager: %s", $fm));
+
+
+	my $events=$n->sun_fm();
+	my @nonok=map { $_->{statusstring} } grep { $_->{status} ne 'ok' } @{$events};
+
+	if (scalar @nonok > 0) {
+		$np->add_message((scalar @nonok > 0) ? CRITICAL : OK,
+			sprintf("Sun FaultManager: %s", join(",", @nonok)));
+	}
 
 	my ($code, $message) = $np->check_messages();
 	$np->plugin_exit( $code, $message );
